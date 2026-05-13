@@ -271,6 +271,24 @@ type ServerConfig struct {
 	// GSSAPIWithMICConfig includes gssapi server and callback, which if both non-nil, is used
 	// when gssapi-with-mic authentication is selected (RFC 4462 section 3).
 	GSSAPIWithMICConfig *GSSAPIWithMICConfig
+
+	// HostbasedCallback, if non-nil, is called when a client attempts
+	// hostbased authentication. Unlike PublicKeyCallback, it is only
+	// called after the client's signature has been verified with hostKey,
+	// using an algorithm from PublicKeyAuthAlgorithms, so the client has
+	// proven possession of the corresponding private key. hostKey is the
+	// client's host key, which may be a *Certificate. Beyond the
+	// signature check, the library does not validate certificates: the
+	// callback must check the certificate's authority, type, principals
+	// and validity period itself, for example with
+	// CertChecker.CheckHostKey. clientHostname and clientUsername are the
+	// client host name and the user name on the client host, exactly as
+	// sent by the client; OpenSSH sends clientHostname as a fully
+	// qualified domain name with a trailing dot. The library does not
+	// check clientHostname against the connection's remote address; that
+	// policy, along with which host keys and users to trust, is left to
+	// the callback. It must return a nil error to allow authentication.
+	HostbasedCallback func(conn ConnMetadata, clientHostname, clientUsername string, hostKey PublicKey) (*Permissions, error)
 }
 
 // AddHostKey adds a private key as a host key. If an existing host
@@ -397,7 +415,8 @@ func (s *connection) serverHandshake(config *ServerConfig) (*Permissions, error)
 	}
 
 	if !config.NoClientAuth && config.PasswordCallback == nil && config.PublicKeyCallback == nil &&
-		config.KeyboardInteractiveCallback == nil && !gssapiWithMICConfigured(config.GSSAPIWithMICConfig) {
+		config.KeyboardInteractiveCallback == nil && config.HostbasedCallback == nil &&
+		!gssapiWithMICConfigured(config.GSSAPIWithMICConfig) {
 		return nil, errors.New("ssh: no authentication methods configured but NoClientAuth is also false")
 	}
 
@@ -599,6 +618,9 @@ type ServerAuthCallbacks struct {
 
 	// GSSAPIWithMICConfig behaves like [ServerConfig.GSSAPIWithMICConfig].
 	GSSAPIWithMICConfig *GSSAPIWithMICConfig
+
+	// HostbasedCallback behaves like [ServerConfig.HostbasedCallback].
+	HostbasedCallback func(conn ConnMetadata, clientHostname, clientUsername string, hostKey PublicKey) (*Permissions, error)
 }
 
 // PartialSuccessError can be returned by any of the [ServerConfig]
@@ -671,6 +693,7 @@ func (s *connection) serverAuthenticate(config *ServerConfig) (*Permissions, err
 		PublicKeyCallback:           config.PublicKeyCallback,
 		KeyboardInteractiveCallback: config.KeyboardInteractiveCallback,
 		GSSAPIWithMICConfig:         config.GSSAPIWithMICConfig,
+		HostbasedCallback:           config.HostbasedCallback,
 	}
 
 userAuthLoop:
@@ -943,6 +966,68 @@ userAuthLoop:
 			if err != nil {
 				return nil, err
 			}
+		case "hostbased":
+			if authConfig.HostbasedCallback == nil {
+				authErr = errors.New("ssh: hostbased auth not configured")
+				break
+			}
+			payload := userAuthReq.Payload
+			algoBytes, payload, ok := parseString(payload)
+			if !ok {
+				return nil, parseError(msgUserAuthRequest)
+			}
+			algo := string(algoBytes)
+			if !slices.Contains(config.PublicKeyAuthAlgorithms, underlyingAlgo(algo)) {
+				authErr = fmt.Errorf("ssh: algorithm %q not accepted", algo)
+				break
+			}
+
+			pubKeyData, payload, ok := parseString(payload)
+			if !ok {
+				return nil, parseError(msgUserAuthRequest)
+			}
+			pubKey, err := ParsePublicKey(pubKeyData)
+			if err != nil {
+				authErr = err
+				break
+			}
+
+			clientHostname, payload, ok := parseString(payload)
+			if !ok {
+				return nil, parseError(msgUserAuthRequest)
+			}
+			clientUsername, payload, ok := parseString(payload)
+			if !ok {
+				return nil, parseError(msgUserAuthRequest)
+			}
+			sig, payload, ok := parseSignature(payload)
+			if !ok || len(payload) > 0 {
+				return nil, parseError(msgUserAuthRequest)
+			}
+
+			// As for publickey, the declared algorithm and the public key
+			// type must be consistent, and ensure the public key algo and
+			// signature algo are supported.
+			if !slices.Contains(algorithmsForKeyFormat(pubKey.Type()), algo) {
+				authErr = fmt.Errorf("ssh: public key type %q not compatible with selected algorithm %q",
+					pubKey.Type(), algo)
+				break
+			}
+			if !slices.Contains(config.PublicKeyAuthAlgorithms, sig.Format) {
+				authErr = fmt.Errorf("ssh: algorithm %q not accepted", sig.Format)
+				break
+			}
+			if !isAlgoCompatible(algo, sig.Format) {
+				authErr = fmt.Errorf("ssh: signature %q not compatible with selected algorithm %q", sig.Format, algo)
+				break
+			}
+
+			signedData := buildDataSignedForHostbased(sessionID, userAuthReq.User, userAuthReq.Service,
+				algo, pubKeyData, string(clientHostname), string(clientUsername))
+			if err := pubKey.Verify(signedData, sig); err != nil {
+				return nil, err
+			}
+			perms, authErr = authConfig.HostbasedCallback(s, string(clientHostname), string(clientUsername), pubKey)
 		default:
 			authErr = fmt.Errorf("ssh: unknown method %q", userAuthReq.Method)
 		}
@@ -1040,6 +1125,9 @@ userAuthLoop:
 		}
 		if authConfig.KeyboardInteractiveCallback != nil {
 			failureMsg.Methods = append(failureMsg.Methods, "keyboard-interactive")
+		}
+		if authConfig.HostbasedCallback != nil {
+			failureMsg.Methods = append(failureMsg.Methods, "hostbased")
 		}
 		if gssapiWithMICConfigured(authConfig.GSSAPIWithMICConfig) {
 			failureMsg.Methods = append(failureMsg.Methods, "gssapi-with-mic")
