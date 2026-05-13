@@ -679,6 +679,72 @@ func (cb KeyboardInteractiveChallenge) auth(session []byte, user string, c packe
 	}
 }
 
+// hostbasedAuthMsg is the wire format for a hostbased auth request.
+// See RFC 4252, section 9.
+type hostbasedAuthMsg struct {
+	User       string `sshtype:"50"`
+	Service    string
+	Method     string
+	Algo       string
+	PubKey     []byte
+	ClientHost string
+	ClientUser string
+	Sig        []byte `ssh:"rest"`
+}
+
+// hostbasedAuth implements AuthMethod for hostbased authentication.
+type hostbasedAuth struct {
+	signer     Signer
+	clientHost string
+	clientUser string
+}
+
+func (h *hostbasedAuth) method() string {
+	return "hostbased"
+}
+
+func (h *hostbasedAuth) auth(session []byte, user string, c packetConn, rand io.Reader, extensions map[string][]byte) (authResult, []string, error) {
+	as, algo, err := pickSignatureAlgorithm(h.signer, extensions)
+	if err != nil {
+		return authFailure, nil, err
+	}
+
+	pubKey := h.signer.PublicKey().Marshal()
+	data := buildDataSignedForHostbased(session, user, serviceSSH, algo, pubKey, h.clientHost, h.clientUser)
+
+	sig, err := as.SignWithAlgorithm(rand, data, underlyingAlgo(algo))
+	if err != nil {
+		return authFailure, nil, err
+	}
+
+	s := Marshal(sig)
+	sigBytes := make([]byte, stringLength(len(s)))
+	marshalString(sigBytes, s)
+
+	msg := hostbasedAuthMsg{
+		User:       user,
+		Service:    serviceSSH,
+		Method:     h.method(),
+		Algo:       algo,
+		PubKey:     pubKey,
+		ClientHost: h.clientHost,
+		ClientUser: h.clientUser,
+		Sig:        sigBytes,
+	}
+	if err := c.writePacket(Marshal(&msg)); err != nil {
+		return authFailure, nil, err
+	}
+
+	return handleAuthResponse(c)
+}
+
+// HostbasedAuth returns an AuthMethod that uses hostbased authentication
+// (RFC 4252 section 9). The signer provides the client host key, clientHost
+// is the FQDN of the client host, and clientUser is the user on the client host.
+func HostbasedAuth(signer Signer, clientHost, clientUser string) AuthMethod {
+	return &hostbasedAuth{signer: signer, clientHost: clientHost, clientUser: clientUser}
+}
+
 type retryableAuthMethod struct {
 	authMethod AuthMethod
 	maxTries   int

@@ -634,6 +634,33 @@ func buildDataSignedForAuth(sessionID []byte, req userAuthRequestMsg, algo strin
 	return Marshal(data)
 }
 
+// buildDataSignedForHostbased returns the data that is signed for hostbased
+// authentication. See RFC 4252, section 9.
+func buildDataSignedForHostbased(sessionID []byte, user, service, keyAlgo string, pubKey []byte, clientHost, clientUser string) []byte {
+	data := struct {
+		Session    []byte
+		Type       byte
+		User       string
+		Service    string
+		Method     string
+		KeyAlgo    string
+		PubKey     []byte
+		ClientHost string
+		ClientUser string
+	}{
+		sessionID,
+		msgUserAuthRequest,
+		user,
+		service,
+		"hostbased",
+		keyAlgo,
+		pubKey,
+		clientHost,
+		clientUser,
+	}
+	return Marshal(data)
+}
+
 func appendU16(buf []byte, n uint16) []byte {
 	return append(buf, byte(n>>8), byte(n))
 }
