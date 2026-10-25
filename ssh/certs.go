@@ -12,6 +12,7 @@ import (
 	"net"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -310,8 +311,9 @@ func (s *algorithmOpenSSHCertSigner) SignWithAlgorithm(rand io.Reader, data []by
 const sourceAddressCriticalOption = "source-address"
 
 // CertChecker does the work of verifying a certificate. Its methods
-// can be plugged into ClientConfig.HostKeyCallback and
-// ServerConfig.PublicKeyCallback. For the CertChecker to work,
+// can be plugged into ClientConfig.HostKeyCallback,
+// ServerConfig.PublicKeyCallback and ServerConfig.HostbasedCallback.
+// For the CertChecker to work,
 // minimally, the IsAuthority callback should be set.
 type CertChecker struct {
 	// SupportedCriticalOptions lists the CriticalOptions that the
@@ -345,6 +347,18 @@ type CertChecker struct {
 	// public key that is not a certificate. It must implement host key
 	// validation or else, if nil, all such keys are rejected.
 	HostKeyFallback HostKeyCallback
+
+	// IsHostbasedUserAllowed should report whether clientUsername on
+	// clientHostname may log in as conn.User() using hostbased
+	// authentication. clientHostname has any trailing dot removed. This must
+	// be set for CertChecker.AuthenticateHostbased to accept any key.
+	IsHostbasedUserAllowed func(conn ConnMetadata, clientHostname, clientUsername string) bool
+
+	// HostbasedKeyFallback is called when CertChecker.AuthenticateHostbased
+	// encounters a public key that is not a certificate. It must implement
+	// validation of client host keys or else, if nil, all such keys are
+	// rejected.
+	HostbasedKeyFallback func(conn ConnMetadata, clientHostname, clientUsername string, key PublicKey) (*Permissions, error)
 
 	// IsRevoked is called for each certificate so that revocation checking
 	// can be implemented. It should return true if the given certificate
@@ -412,6 +426,54 @@ func (c *CertChecker) Authenticate(conn ConnMetadata, pubKey PublicKey) (*Permis
 	}
 
 	return &cert.Permissions, nil
+}
+
+// AuthenticateHostbased checks a hostbased authentication request: the
+// client user mapping and the client host key. It can be used as a value for
+// ServerConfig.HostbasedCallback.
+//
+// IsHostbasedUserAllowed must be set: it is consulted first, for both
+// certificates and plain keys, to decide whether clientUsername on
+// clientHostname may log in as conn.User(), as OpenSSH does with hosts.equiv
+// and .shosts. Without it, every request is rejected.
+//
+// A certificate must be a host certificate signed by an authority for which
+// IsHostAuthority returns true; IsHostAuthority is passed the client host
+// name. The client host name, with any trailing dot removed (OpenSSH sends a
+// fully qualified name with a trailing dot), is checked against the
+// certificate's principals. Plain keys are passed to HostbasedKeyFallback.
+//
+// AuthenticateHostbased does not check clientHostname against the
+// connection's remote address.
+func (c *CertChecker) AuthenticateHostbased(conn ConnMetadata, clientHostname, clientUsername string, key PublicKey) (*Permissions, error) {
+	host := strings.TrimSuffix(clientHostname, ".")
+	if c.IsHostbasedUserAllowed == nil {
+		return nil, errors.New("ssh: cannot authorize hostbased login, IsHostbasedUserAllowed not set")
+	}
+	if !c.IsHostbasedUserAllowed(conn, host, clientUsername) {
+		return nil, fmt.Errorf("ssh: user %q on %q not allowed to log in as %q", clientUsername, host, conn.User())
+	}
+
+	cert, ok := key.(*Certificate)
+	if !ok {
+		if c.HostbasedKeyFallback != nil {
+			return c.HostbasedKeyFallback(conn, clientHostname, clientUsername, key)
+		}
+		return nil, errors.New("ssh: non-certificate client host key")
+	}
+	if cert.CertType != HostCert {
+		return nil, fmt.Errorf("ssh: certificate presented as a client host key has type %d", cert.CertType)
+	}
+	if c.IsHostAuthority == nil {
+		return nil, errors.New("ssh: cannot verify certificate, IsHostAuthority not set")
+	}
+	if !c.IsHostAuthority(cert.SignatureKey, host) {
+		return nil, fmt.Errorf("ssh: no authorities for client host: %q", host)
+	}
+	if err := c.CheckCert(host, cert); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 // CheckCert checks CriticalOptions, ValidPrincipals, revocation, timestamp and

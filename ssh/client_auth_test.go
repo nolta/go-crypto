@@ -2306,19 +2306,31 @@ func TestHostbasedAuthNotConfigured(t *testing.T) {
 
 func TestHostbasedAuthCertificate(t *testing.T) {
 	caKey := testSigners["ecdsa"]
+	const revokedSerial = 666
 	checker := &CertChecker{
 		IsHostAuthority: func(auth PublicKey, address string) bool {
-			return bytes.Equal(auth.Marshal(), caKey.PublicKey().Marshal())
+			return bytes.Equal(auth.Marshal(), caKey.PublicKey().Marshal()) && address == "client.example.com"
+		},
+		IsRevoked: func(cert *Certificate) bool {
+			return cert.Serial == revokedSerial
+		},
+		IsHostbasedUserAllowed: func(conn ConnMetadata, clientHostname, clientUsername string) bool {
+			return true
 		},
 	}
 
-	newCert := func(key string, certType uint32, principal string, validBefore uint64, ca Signer) Signer {
+	// newCert returns a signer for a host certificate for
+	// client.example.com signed by ca, after applying modify.
+	newCert := func(key string, ca Signer, modify func(*Certificate)) Signer {
 		t.Helper()
 		cert := &Certificate{
 			Key:             testPublicKeys[key],
-			CertType:        certType,
-			ValidPrincipals: []string{principal},
-			ValidBefore:     validBefore,
+			CertType:        HostCert,
+			ValidPrincipals: []string{"client.example.com"},
+			ValidBefore:     CertTimeInfinity,
+		}
+		if modify != nil {
+			modify(cert)
 		}
 		if err := cert.SignCert(rand.Reader, ca); err != nil {
 			t.Fatalf("SignCert: %v", err)
@@ -2331,16 +2343,26 @@ func TestHostbasedAuthCertificate(t *testing.T) {
 	}
 
 	tests := []struct {
-		name   string
-		signer Signer
-		wantOK bool
+		name           string
+		signer         Signer
+		clientHostname string
+		wantOK         bool
 	}{
-		{"ed25519", newCert("ed25519", HostCert, "client.example.com", CertTimeInfinity, caKey), true},
-		{"rsa", newCert("rsa", HostCert, "client.example.com", CertTimeInfinity, caKey), true},
-		{"wrong principal", newCert("ed25519", HostCert, "other.example.com", CertTimeInfinity, caKey), false},
-		{"user certificate", newCert("ed25519", UserCert, "client.example.com", CertTimeInfinity, caKey), false},
-		{"expired", newCert("ed25519", HostCert, "client.example.com", 1, caKey), false},
-		{"untrusted authority", newCert("ed25519", HostCert, "client.example.com", CertTimeInfinity, testSigners["rsa"]), false},
+		// OpenSSH sends the client host name with a trailing dot.
+		{"ed25519", newCert("ed25519", caKey, nil), "client.example.com.", true},
+		{"rsa", newCert("rsa", caKey, nil), "client.example.com.", true},
+		{"no trailing dot", newCert("ed25519", caKey, nil), "client.example.com", true},
+		{"no principals", newCert("ed25519", caKey, func(c *Certificate) { c.ValidPrincipals = nil }), "client.example.com.", true},
+		{"wrong client host", newCert("ed25519", caKey, func(c *Certificate) { c.ValidPrincipals = nil }), "other.example.com.", false},
+		{"wrong principal", newCert("ed25519", caKey, func(c *Certificate) { c.ValidPrincipals = []string{"other.example.com"} }), "client.example.com.", false},
+		{"principal with trailing dot", newCert("ed25519", caKey, func(c *Certificate) { c.ValidPrincipals = []string{"client.example.com."} }), "client.example.com.", false},
+		{"user certificate", newCert("ed25519", caKey, func(c *Certificate) { c.CertType = UserCert }), "client.example.com.", false},
+		{"expired", newCert("ed25519", caKey, func(c *Certificate) { c.ValidBefore = 1 }), "client.example.com.", false},
+		{"revoked", newCert("ed25519", caKey, func(c *Certificate) { c.Serial = revokedSerial }), "client.example.com.", false},
+		{"unsupported critical option", newCert("ed25519", caKey, func(c *Certificate) {
+			c.CriticalOptions = map[string]string{"force-command": "/bin/true"}
+		}), "client.example.com.", false},
+		{"untrusted authority", newCert("ed25519", testSigners["rsa"], nil), "client.example.com.", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2348,12 +2370,7 @@ func TestHostbasedAuthCertificate(t *testing.T) {
 			serverConfig := &ServerConfig{
 				HostbasedCallback: func(conn ConnMetadata, clientHostname, clientUsername string, key PublicKey) (*Permissions, error) {
 					_, gotCert = key.(*Certificate)
-					// The port is a placeholder: CheckHostKey expects host:port.
-					host := strings.TrimSuffix(clientHostname, ".")
-					if err := checker.CheckHostKey(net.JoinHostPort(host, "0"), conn.RemoteAddr(), key); err != nil {
-						return nil, err
-					}
-					return nil, nil
+					return checker.AuthenticateHostbased(conn, clientHostname, clientUsername, key)
 				},
 			}
 			serverConfig.AddHostKey(testSigners["rsa"])
@@ -2361,8 +2378,7 @@ func TestHostbasedAuthCertificate(t *testing.T) {
 			clientConfig := &ClientConfig{
 				User: "testuser",
 				Auth: []AuthMethod{
-					// OpenSSH sends the client host name with a trailing dot.
-					Hostbased(tt.signer, "client.example.com.", "localuser"),
+					Hostbased(tt.signer, tt.clientHostname, "localuser"),
 				},
 				HostKeyCallback: InsecureIgnoreHostKey(),
 			}
@@ -2375,6 +2391,127 @@ func TestHostbasedAuthCertificate(t *testing.T) {
 			}
 			if !gotCert {
 				t.Error("HostbasedCallback was not called with a *Certificate")
+			}
+		})
+	}
+}
+
+func TestHostbasedAuthCertCheckerPlainKey(t *testing.T) {
+	hostKey := testSigners["ed25519"]
+	fallback := func(conn ConnMetadata, clientHostname, clientUsername string, key PublicKey) (*Permissions, error) {
+		if bytes.Equal(key.Marshal(), hostKey.PublicKey().Marshal()) && clientHostname == "client.example.com." {
+			return nil, nil
+		}
+		return nil, errors.New("unknown host key")
+	}
+
+	tests := []struct {
+		name     string
+		fallback func(ConnMetadata, string, string, PublicKey) (*Permissions, error)
+		wantOK   bool
+	}{
+		{"no fallback", nil, false},
+		{"fallback", fallback, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checker := &CertChecker{
+				IsHostAuthority: func(auth PublicKey, address string) bool {
+					return true
+				},
+				IsHostbasedUserAllowed: func(conn ConnMetadata, clientHostname, clientUsername string) bool {
+					return true
+				},
+				HostbasedKeyFallback: tt.fallback,
+			}
+			serverConfig := &ServerConfig{
+				HostbasedCallback: checker.AuthenticateHostbased,
+			}
+			serverConfig.AddHostKey(testSigners["rsa"])
+
+			clientConfig := &ClientConfig{
+				User: "testuser",
+				Auth: []AuthMethod{
+					Hostbased(hostKey, "client.example.com.", "localuser"),
+				},
+				HostKeyCallback: InsecureIgnoreHostKey(),
+			}
+			err := tryHostbasedAuth(t, clientConfig, serverConfig)
+			if tt.wantOK && err != nil {
+				t.Errorf("hostbased auth failed: %v", err)
+			}
+			if !tt.wantOK && err == nil {
+				t.Error("hostbased auth succeeded, want failure")
+			}
+		})
+	}
+}
+
+func TestHostbasedAuthCertCheckerUserPolicy(t *testing.T) {
+	caKey := testSigners["ecdsa"]
+	cert := &Certificate{
+		Key:             testPublicKeys["ed25519"],
+		CertType:        HostCert,
+		ValidPrincipals: []string{"client.example.com"},
+		ValidBefore:     CertTimeInfinity,
+	}
+	if err := cert.SignCert(rand.Reader, caKey); err != nil {
+		t.Fatalf("SignCert: %v", err)
+	}
+	certSigner, err := NewCertSigner(cert, testSigners["ed25519"])
+	if err != nil {
+		t.Fatalf("NewCertSigner: %v", err)
+	}
+	acceptAll := func(conn ConnMetadata, clientHostname, clientUsername string, key PublicKey) (*Permissions, error) {
+		return nil, nil
+	}
+	// sameUser allows a client user to log in only as the same user name,
+	// and checks that the trailing dot was removed from clientHostname.
+	sameUser := func(conn ConnMetadata, clientHostname, clientUsername string) bool {
+		return clientHostname == "client.example.com" && clientUsername == conn.User()
+	}
+
+	tests := []struct {
+		name           string
+		signer         Signer
+		clientUsername string
+		userAllowed    func(ConnMetadata, string, string) bool
+		wantOK         bool
+	}{
+		{"cert, policy not set", certSigner, "testuser", nil, false},
+		{"cert, user allowed", certSigner, "testuser", sameUser, true},
+		{"cert, user denied", certSigner, "localuser", sameUser, false},
+		{"plain key, policy not set", testSigners["ed25519"], "testuser", nil, false},
+		{"plain key, user allowed", testSigners["ed25519"], "testuser", sameUser, true},
+		{"plain key, user denied", testSigners["ed25519"], "localuser", sameUser, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checker := &CertChecker{
+				IsHostAuthority: func(auth PublicKey, address string) bool {
+					return bytes.Equal(auth.Marshal(), caKey.PublicKey().Marshal())
+				},
+				IsHostbasedUserAllowed: tt.userAllowed,
+				HostbasedKeyFallback:   acceptAll,
+			}
+			serverConfig := &ServerConfig{
+				HostbasedCallback: checker.AuthenticateHostbased,
+			}
+			serverConfig.AddHostKey(testSigners["rsa"])
+
+			clientConfig := &ClientConfig{
+				User: "testuser",
+				Auth: []AuthMethod{
+					Hostbased(tt.signer, "client.example.com.", tt.clientUsername),
+				},
+				HostKeyCallback: InsecureIgnoreHostKey(),
+			}
+			err := tryHostbasedAuth(t, clientConfig, serverConfig)
+			if tt.wantOK && err != nil {
+				t.Errorf("hostbased auth failed: %v", err)
+			}
+			if !tt.wantOK && err == nil {
+				t.Error("hostbased auth succeeded, want failure")
 			}
 		})
 	}

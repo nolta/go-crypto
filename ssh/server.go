@@ -281,13 +281,14 @@ type ServerConfig struct {
 	// signature check, the library does not validate certificates: the
 	// callback must check the certificate's authority, type, principals
 	// and validity period itself, for example with
-	// CertChecker.CheckHostKey. clientHostname and clientUsername are the
-	// client host name and the user name on the client host, exactly as
-	// sent by the client; OpenSSH sends clientHostname as a fully
-	// qualified domain name with a trailing dot. The library does not
-	// check clientHostname against the connection's remote address; that
-	// policy, along with which host keys and users to trust, is left to
-	// the callback. It must return a nil error to allow authentication.
+	// [CertChecker.AuthenticateHostbased]. clientHostname and
+	// clientUsername are the client host name and the user name on the
+	// client host, exactly as sent by the client; OpenSSH sends
+	// clientHostname as a fully qualified domain name with a trailing
+	// dot. The library does not check clientHostname against the
+	// connection's remote address; that policy, along with which host
+	// keys and users to trust, is left to the callback. It must return a
+	// nil error to allow authentication.
 	HostbasedCallback func(conn ConnMetadata, clientHostname, clientUsername string, hostKey PublicKey) (*Permissions, error)
 }
 
